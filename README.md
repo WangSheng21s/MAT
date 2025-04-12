@@ -31,7 +31,7 @@ Please find more details of this work in our paper.
 ## Setup
 ### Install Dependencies
 
-The code is based on huggaface's [transformers](https://github.com/huggingface/transformers). 
+The code is based on huggaface's [transformers](https://github.com/huggingface/transformers) and YeDeming's [PL-Marker](https://github.com/thunlp/PL-Marker). 
 
 Install dependencies and [apex](https://github.com/NVIDIA/apex):
 ```
