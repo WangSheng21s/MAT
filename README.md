@@ -21,7 +21,7 @@ dictionary information, further pre-training on large-scale EMRs, and auxiliary 
 
 In this work, Our main contributions can be summarized as follows:
 
-1. We propose MAT, a strong medical IE framework achieving better performance than previous SOTA relation extraction models. This model is a successful application of markers and utilization of medical dictionary in medical IE tasks. We will release our code and collected dictionary to facilitate future research.
+1. We propose MAT, a strong medical IE framework achieving better performance than previous SOTA relation extraction models. This model is a successful application of markers and utilization of medical dictionary in medical IE tasks. We will release our code and collected dictionary to facilitate future research.
 
 2. We train HwaMei-BERT on large-scale EMRs, and show that it can consistently improve the model performance on downstream IE tasks. HwaMei-BERT will also be publicly released.
 
