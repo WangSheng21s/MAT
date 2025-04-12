@@ -1,5 +1,5 @@
 # MAT
-We propose Marker LAttice Transformer (MAT), a strong framework for medical IE. This framework is composed of three separate models, each designed for a specific task: medical entity recognition (MER), medical relation extraction (MRE), and medical attribute extraction (MAE). All the models are deeply based on markers embedded in the input text, with which the models compute representations from bottom to top layers.
+We propose Marker LAttice Transformer (MAT), a strong framework for medical IE. This framework is composed of three separate models, each designed for a specific task: medical entity recognition (MER), medical relation extraction (MRE), and medical attribute extraction (MAE). All the models are deeply based on markers embedded in the input text, with which the models compute representations from bottom to top layers.
 This allows the representations to encode deep semantic information, leading to better outputs. In addition, we enhance the models by lattice-style incorporation of medical
 dictionary information, further pre-training on large-scale EMRs, and auxiliary inputs of medical departments and EMR sections.
 
@@ -17,7 +17,7 @@ dictionary information, further pre-training on large-scale EMRs, and auxiliary 
 
 
 ## Overview
-![](./figs/overview.jpg)
+![](./figs/fig1.png)
 
 In this work, we present a novel span representation approach, named Packed Levitated Markers,  to consider the dependencies between the spans (pairs) by strategically packing the markers in the encoder. Our approach is evaluated on two typical span (pair) representation tasks:
 
