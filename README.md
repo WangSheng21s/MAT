@@ -19,13 +19,13 @@ dictionary information, further pre-training on large-scale EMRs, and auxiliary 
 ## Overview
 ![](./figs/fig1.png)
 
-In this work, we present a novel span representation approach, named Packed Levitated Markers,  to consider the dependencies between the spans (pairs) by strategically packing the markers in the encoder. Our approach is evaluated on two typical span (pair) representation tasks:
+In this work, Our main contributions can be summarized as follows:
 
-1. Named Entity Recognition (NER): Adopt a group packing strategy for enabling our model to process massive spans together to consider their dependencies with limited resources.
+1. We propose MAT, a strong medical IE framework achieving better performance than previous SOTA relation extraction models. This model is a successful application of markers and utilization of medical dictionary in medical IE tasks. We will release our code and collected dictionary to facilitate future research.
 
-2. Relation Extraction (RE): Adopt a subject-oriented packing strategy for packing each subject and all its objects into an instance to model the dependencies between the same-subject span pairs
+2. We train HwaMei-BERT on large-scale EMRs, and show that it can consistently improve the model performance on downstream IE tasks. HwaMei-BERT will also be publicly released.
 
-Please find more details of this work in our paper.
+3. We employ auxiliary information indicators of medical departments and EMR sections, which effectively introduce global context and further contribute to the model performance.
 
 
 ## Setup
