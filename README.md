@@ -10,7 +10,6 @@ dictionary information, further pre-training on large-scale EMRs, and auxiliary 
   * [Data Preprocessing](#Download-and-preprocess-the-datasets)
   * [Trained Models](#Trained-Models)
 * [Training Script](#Training-script)
-* [Quick Start](#Quick-start)
 
 
 
