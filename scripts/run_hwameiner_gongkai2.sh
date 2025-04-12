@@ -5,10 +5,10 @@ GPU_ID=3,4,5
 mkdir hwameiner_models
 
 
-for seed in 32; do
+for seed in 32 33 34 35 36; do
 CUDA_VISIBLE_DEVICES=$GPU_ID  python3 run_hwameiner_gongkai.py  --model_type bertspanmarker  \
-    --model_name_or_path  ../data/bert_models/bert-base-hm-wwm-20e-384b-15m  --do_lower_case  \
-    --data_dir ../DataSet/hwamei_gongkai  \
+    --model_name_or_path  ./bert-base-hm-wwm-20e-384b-15m  --do_lower_case  \
+    --data_dir ./DataSet/hwamei_500  \
     --learning_rate 2e-5  --num_train_epochs 10  --per_gpu_train_batch_size  8  --per_gpu_eval_batch_size 16  --gradient_accumulation_steps 1  \
     --max_seq_length 512  --save_steps 20000  --max_pair_length 256  --max_mention_ori_length 28    \
     --do_train --do_eval  --evaluate_during_training   --eval_all_checkpoints  \
@@ -20,10 +20,6 @@ CUDA_VISIBLE_DEVICES=$GPU_ID  python3 run_hwameiner_gongkai.py  --model_type ber
     --add_cixinxi  \
     --add_binglixinxi2 3\
     --ci_use_diff \
-    #--add_binglixinxi 1\
-    #--continue_train_from_saved_model ./hwameiner_models/PL-Marker-hwamei-bert-40-3/checkpoint-103775  \
-    #--add_binglixinxi2 3 \
 
-    #--lminit
 done;
 
