@@ -8,12 +8,10 @@ dictionary information, further pre-training on large-scale EMRs, and auxiliary 
 * [Setup](#Setup)
   * [Install Dependencies](#Install-dependencies)
   * [Data Preprocessing](#Download-and-preprocess-the-datasets)
-  * [Data Format](#Input-data-format)
   * [Trained Models](#Trained-Models)
 * [Training Script](#Training-script)
 * [Quick Start](#Quick-start)
-* [CoNLL03 with Dev](#CoNLL03-with-dev)
-* [Citation](#Citation)
+
 
 
 ## Overview
@@ -31,7 +29,7 @@ In this work, Our main contributions can be summarized as follows:
 ## Setup
 ### Install Dependencies
 
-The code is based on huggaface's [transformers](https://github.com/huggingface/transformers) and YeDeming's [PL-Marker](https://github.com/thunlp/PL-Marker). 
+The code is based on huggaface's [transformers](https://github.com/huggingface/transformers) and YeDeming's [PL-Marker](https://github.com/thunlp/PL-Marker). Thanks for their insightful work!
 
 Install dependencies and [apex](https://github.com/NVIDIA/apex):
 ```
