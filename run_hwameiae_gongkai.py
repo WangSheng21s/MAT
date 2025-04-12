@@ -1,0 +1,1061 @@
+#该代码用来做hwamei数据集上面的属性抽取任务
+""" Finetuning the library models for sequence classification on GLUE (Bert, XLM, XLNet, RoBERTa)."""
+
+from __future__ import absolute_import, division, print_function
+
+import argparse
+import glob
+import logging
+import os
+import random
+from collections import defaultdict
+import re
+import shutil
+
+import numpy as np
+import torch
+from torch import nn
+from torch.utils.data import (DataLoader, RandomSampler, SequentialSampler,
+                              TensorDataset)
+from torch.utils.data.distributed import DistributedSampler
+from tensorboardX import SummaryWriter
+from tqdm import tqdm, trange
+import time
+from transformers import (WEIGHTS_NAME, BertConfig,
+                          BertTokenizer,
+                          RobertaConfig,
+                          RobertaTokenizer,
+                          get_linear_schedule_with_warmup,
+                          AdamW,
+                          BertForACEBothOneDropoutSub,
+                          AlbertForACEBothSub,
+                          AlbertConfig,
+                          AlbertTokenizer,
+                          AlbertForACEBothOneDropoutSub,
+                          BertForACEBothOneDropoutSubNoNer,
+                          BertForHwaMeiAE,
+                          )
+
+from transformers import AutoTokenizer
+from torch.utils.data import TensorDataset, Dataset
+import json
+import pickle
+import numpy as np
+import unicodedata
+import itertools
+import timeit
+
+from tqdm import tqdm
+import dic  # dic用于构建词典，向模型中引入词信息
+
+logger = logging.getLogger(__name__)
+
+ALL_MODELS = sum((tuple(conf.pretrained_config_archive_map.keys()) for conf in (BertConfig, AlbertConfig)), ())
+
+MODEL_CLASSES = {
+    'bertsub': (BertConfig, BertForHwaMeiAE, BertTokenizer),
+    'bertnonersub': (BertConfig, BertForACEBothOneDropoutSubNoNer, BertTokenizer),
+    'albertsub': (AlbertConfig, AlbertForACEBothOneDropoutSub, AlbertTokenizer),
+}
+
+task_ner_labels = {
+    'ace04': ['FAC', 'WEA', 'LOC', 'VEH', 'GPE', 'ORG', 'PER'],
+    'ace05': ['FAC', 'WEA', 'LOC', 'VEH', 'GPE', 'ORG', 'PER'],
+    'scierc': ['Method', 'OtherScientificTerm', 'Task', 'Generic', 'Material', 'Metric'],
+    'hwamei': ['NIL', 'Self_Reported_Abnormality', 'Test_Result', 'Test_Process', 'Drug', 'Disease_or_Syndrome',
+               'Abnormal_Test_Result', 'Operation', 'Body_Part', 'Equipment', 'Drug_Dose', 'Prevention', 'Treatment',
+               'Care', 'Injury_or_Poisoning', 'Department', 'Organ_Damage', 'Personal_History', 'Body_Matter'],
+}
+
+task_rel_labels = {
+    'ace04': ['PER-SOC', 'OTHER-AFF', 'ART', 'GPE-AFF', 'EMP-ORG', 'PHYS'],
+    'ace05': ['PER-SOC', 'ART', 'ORG-AFF', 'GEN-AFF', 'PHYS', 'PART-WHOLE'],
+    'scierc': ['PART-OF', 'USED-FOR', 'FEATURE-OF', 'CONJUNCTION', 'EVALUATE-FOR', 'HYPONYM-OF', 'COMPARE'],
+    'hwamei': ['Status_Cause_Info', 'Info_Suggest_Status', 'Interv_Worse_Status', 'Status_Req_Info',
+               'Status_Req_Interv', 'Info_Contra_Interv', 'Interv_Better_Status', 'Info_Exclude_Status',
+               'Interv_Req_Info', 'Interv_Cause_Status', 'Interv_Cause_Status', 'Info_Permit_Interv']
+}
+
+task_ae_labels = {
+    'hwamei':['Negation', 'Family', 'Analysis', 'Uncertainty', 'Conditionality', 'Occasionality', 'Better', 'Worse', 'History', 'Future']
+}
+
+
+
+departments_label = ['gAAAAABkJOwVGx_1aZ9UsdGQFG3m7BZEn1kugLAwRcENw3Zd--D4ejw_DWfSEAqHpqYS5GNyHAMahv99R5SAMqfKzeCMpB26MQ==', 'gAAAAABkJOwVZJ4T5tIwpaLhlgg7vF_EnrchYWcAPDqIh8AuAZsZV_MLzMWKIMnq4jzRIG-s3LwmHSofdx6bz9lLgDsYPiGHcg==', 'gAAAAABkJOwVpQkBY1vYmmmej5L7-lkDSyueKXWGH45x_I6HDSfQvZWbpaC52PpRVA_Q-ojC3VClVQR6yVsVXuZ4IVsM0qQrVw==', 'gAAAAABkJOwVhjivEDrsEsxlvVQt4eJNjFxaPsOGduicH_6dl7tTmIIMNaMhDTyVXdjhItEGggpX7lwsv2JeP862QHfrnoVdHQ==', 'gAAAAABkJOwVHkUdQARbCN4nEd47OYC7jNCWmg-GV0T_4Qg1OrUAhVCcj9d04VYWLUHvS5LHBa27n8xw1SP7dTq39v0RtksiwA==', 'gAAAAABkJOwVmqfXTwzCCIu_xWjK7wgtrwypfVGFxSfwWYjBSuWZi0y9oJIXex6m-fH6nUxRj8MvSHZiDtMaIjdSwUVvHgA0nA==', 'gAAAAABkJOwUZuHG9C_B1t8_OIbsgRvQH9o_N9Cni3yNGcGV5eL7XOQNoy-Mr7MspXVD_gUS6tzniJxPaBN2CqDnVrX6jvVD2A==', 'gAAAAABkJOwVqJyOngsuUnXc0ZjitTdeF3oZD7iLgbOfZh8GndK5WjoZxW3erGlx4XpqvfNdlztGo2H34COGZiVnKDP4gAJS_A==', 'gAAAAABkJOwVSbkxtZuXjl_9Ihp5-y561zDute4h8xRlTmjROZWBgU_5Wzp0aabi8c_U0gSZ_rk3aEqetK3amArrG5TZoH85iQ==', 'gAAAAABkJOwURECI8L5XhuVEvjVNoY7MSraXXQwkHdFr1KwXMg9czJieHJp15Hj8Jd0zJETcZOTzI0IjuJc6Z83wUnIUcJBfGg==', 'gAAAAABkJOwUn9e_DnzDjpYQIcwIMKq0z61S9YfU5hD6bHHCbbQ_bpoK3wnvAcstyMqZLSEaWDitE1-ndgxKdITmkMzO85yGcg==', 'gAAAAABkJOwVUiTmVLgOccAYSdK9-_LVjQ_6GP6Ogm0otktZHWGOwRcV99GR4DuU5GMrt_PUM9MkrIJTJ_4yAu1FpYscleBhGw==', 'gAAAAABkJOwVnzF8rNOkzgFheIeIDWIWg_SHKE5I9G1RLae316_YWMKLvqRVNTk5EtDEPBWBMVeC46i17ecEVxaELJudCixFMQ==', 'gAAAAABkJOwU2HXSE5eq85Rhe9IRKeZGVSVGmVCkznGAitLhnTPcQK-wwiVPi0_EriMY1-LRrVfR9j6GGcM6myH2HAS1uQ_-Qw==', 'gAAAAABkJOwVUWqL5Oe70bB78ZmPlE4Sh7kyxLKEnimOsN_K_2H7YKxl9z_5xx-DU_XXnLzee359SifmYM4T1lABMJbhbBG6AA==', 'gAAAAABkJOwVsUTgURIx7bNj9N1Gcet-kCSXFKtn751faQgbsFurpwsM6jMTwYYQ7_juc2i01CHCU5bJ8ZuYlL1ll_BbfMcW5A==', 'gAAAAABkJOwUvRYNmPbhvtAhjgKXv3Uk1u_i6zY-rFO4Xxuew5YGwpAz58wYGGP_B1FInfJw-pxV3wfHy4R58cYvTJxssl3YyA==', 'gAAAAABkJOwU7e2R_FrRmimT_pt-vS6flgo9v9SMuueE1fVmgeXs7AF-uXhmrABmgCqPcq-j1nQaObN6w5U50NvffKb17EsY3g==', 'gAAAAABkJOwUaT3FPq5vy6EzsMiqDiPd4np0-O2ziSiJuRQRzkFJgIDLC-YNChjuvdDLuTAvcMy1YCkVBtLojEbqtsrPHewndQ==', 'gAAAAABkJOwV0xIKWHzOF93v90ys9UFwtHbiojbhyAYAjeNU-sBvt7eIX0qMT2w2StkIA7l_1UCq-V5Xem6X_CmBWq2n_vO1Ow==', 'gAAAAABkJOwUgDoEeeR4srw3l72cOHLetSUOgJwQrGokO4MHpKCfnUnR1CylCn3eK15Ban09ubnwI7ytHY9FszMNhWBaLi4lFQ==', 'gAAAAABkJOwVaPfdxlmPNwaKMw2hiklQwCg9xpZrULNLatM3biEVZa-XtQbF6QvolJ5-hSuNquDM8fyly0hPR1f93wUL5_odeQ==', 'gAAAAABkJOwVYaIUdUA7n_Rl-7sOoR7xIFAMqWcUY9gL1S9T3IKYjqc9EUlWKqZ9sFa4ya6WTfA3Kqxu75GMaQmlwPqF7NAumQ==', 'gAAAAABkJOwVmDoookP7XrJPARs2h9w6NgE1a-gV0vk0ka4wjo4NsTYp9fw9Pf8xSL9S44PlA-g80WMh83WvCbq8Qxoj-ki6vQ==', 'gAAAAABkJOwVD8_9Qllsb7nQZtk-eI8SyiAwMdi9_kqOxw-D9Ub5EgioTac-czMUwZAza0ohfRIqWGR0-5EPRanaoqfJ9_-ohg==', 'gAAAAABkJOwV0R_-lBZ5-ZhW4rGHIBeWyvA9-JmETcW1G9jS8yNiHyfl-JyukWI6OtlCDi6UR_C3tF-mGMPTJBGeZaOfOtpTBw==', 'gAAAAABkJOwUJSaC3mQ-zmXcxgUkGTUMKjdJLnzkkyzKTmPB7YusvfnaJNNMOUmteAWe5j0H9ULy9Dln5Bu96T1H441hgiiRLw==', 'gAAAAABkJOwVH0g4l3CAyTpl_s3rudLlnN8xYHvlk819SiOsuQ5SjWWa6TGpnqh6hBlwpDxZqtEk0UeMWWDtibrrNM7yW6WUhQ==', 'gAAAAABkJOwUMNQ6bjbCtA5XRCbfyKGftgXySXMLpW7HXEdVv0vED_2VaGJgXeg7GoBuqAdX1HwdOXPlGeT_Cv1w-YHW_sSvSg==', 'gAAAAABkJOwVy59m8Ve4lVou6bXAMtXBmT-de2-7e23b4pl5UvkZQBnaQ2RZTd7V7iPFxZmqJawzQblmiwozikphSFI7KRF0ug==', 'gAAAAABkJOwVczKypEp1N7YWpEF-GYe4YyInSImXrYbj67SkoA6S_7im8DwQRVVfL-zYPf5Ng3n53zXYs3iCAN34OK89NL_ECg==', 'gAAAAABkJOwVwEHezZoGSNV6BphXUo0ZVdfDgQoGCnO-DOD4DaY7Jwnu2Jy7PfiiFniY1Vgbb-PmtJREhGuBnDnkqLtX1zxd_w==', 'gAAAAABkJOwV5lB_1oyOSrWMFvBfICsU2zaQ-Zq_BdZJ2uGQBsEHCoYkXxADD97Pc-SoMSxw9UaVWQHJpbDrBZZg5DiKyCcXAQ==', 'gAAAAABkJOwULAhnKpjc9kr89sx1qFc0XcKq47Qqhgl626eyHGvD87R98nOYB5PPpAOhnwE0x2CS8rUEaqSuBOJFHxrxCYUolQ==', 'gAAAAABkJOwU-QNbBt2n0zknybcPiyqjSKGRAmf8PtGgnZuRFqX2BbQSC-DVPDeuBT5T1pwLNeakNOQJCTsGsRyOmb1Iqwalzg==', 'gAAAAABkJOwV_gZ6jcIf21kAKvZBWdmU7sybf5jV0DiHCEJasbjawwKRWU7lyA1iAZIoY99IM3fdjWP3PJQWhh4LBdyvb7F67A==', 'gAAAAABkJOwUvnMyiUEgOWEFMz3NcjvVOUTcmmpAtD0B846JeYcZpa0Cv8bQH1bA_S3g4rBvdYoyQYVPLlWvjIJfDpdb-gzdcg==']
+
+
+departments_label_map  = {departments_label[i]:i for i in range(len(departments_label))}
+
+
+
+
+
+class ACEDataset(Dataset):
+    def __init__(self, tokenizer, args=None, evaluate=False, do_test=False, max_pair_length=None):
+
+        if not evaluate:
+            file_path = os.path.join(args.data_dir, args.train_file)
+        else:
+            if do_test:
+                if args.test_file.find('models') == -1:
+                    file_path = os.path.join(args.data_dir, args.test_file)
+                else:
+                    file_path = args.test_file
+            else:
+                if args.dev_file.find('models') == -1:
+                    file_path = os.path.join(args.data_dir, args.dev_file)
+                else:
+                    file_path = args.dev_file
+
+        assert os.path.isfile(file_path)
+
+        self.file_path = file_path
+        self.do_test = do_test
+        self.tokenizer = tokenizer
+        self.max_seq_length = args.max_seq_length
+        self.max_pair_length = max_pair_length
+        self.max_entity_length = self.max_pair_length * 2
+
+        self.evaluate = evaluate
+        self.use_typemarker = args.use_typemarker
+        self.local_rank = args.local_rank
+        self.args = args
+        self.model_type = args.model_type
+        self.no_sym = args.no_sym
+
+
+
+
+        self.ner_label_list = ['NIL', 'Self_Reported_Abnormality', 'Test_Result', 'Test_Process', 'Drug',
+                               'Disease_or_Syndrome', 'Abnormal_Test_Result', 'Operation', 'Body_Part', 'Equipment',
+                               'Drug_Dose', 'Prevention', 'Treatment', 'Care', 'Injury_or_Poisoning', 'Department',
+                               'Organ_Damage', 'Personal_History', 'Body_Matter']
+
+        label_list = ['Status_Cause_Info', 'Info_Suggest_Status', 'Interv_Worse_Status', 'Status_Req_Info',
+                      'Status_Req_Interv', 'Info_Contra_Interv', 'Interv_Better_Status', 'Info_Exclude_Status',
+                      'Interv_Req_Info', 'Interv_Cause_Status', 'Info_Permit_Interv']
+        self.sym_labels = ['NIL']
+        self.label_list = self.sym_labels + label_list
+
+        self.attr_label_list = ['Negation', 'Family', 'Analysis', 'Uncertainty', 'Conditionality', 'Occasionality', 'Better', 'Worse', 'History', 'Future']#属性抽取的全部标签
+
+        self.global_predicted_ners = {}
+        self.initialize()
+
+
+    def is_rqi(self, str_x=''):
+        for i in range(len(str_x)):
+            if str_x[i] not in key_label:
+                return False
+
+        return True
+
+    def initialize(self):
+        tokenizer = self.tokenizer
+        ner_label_map = {label: i for i, label in enumerate(self.ner_label_list)}
+        attr_label_map = {label: i for i, label in enumerate(self.attr_label_list)}
+
+
+        f = open(self.file_path, "r", encoding='utf-8')
+        self.ner_tot_recall = 0
+        self.tot_recall = 0
+        self.data = []
+        self.ner_golden_labels = set([])
+        self.golden_labels = {}
+        self.golden_labels_map = {}
+        self.golden_labels_withner = set([])
+        maxR = 0
+        maxL = 0
+        for l_idx, line in enumerate(f):
+            data = json.loads(line)
+
+
+            words = data['tokens']
+            if 'predicted_ner' in data:  # e2e predict
+                ners = data['predicted_ner']
+            else:
+                ners = data['entities']
+
+            std_ners = data['entities']
+
+            attributes = data['attributes']
+            self.tot_recall += len(attributes)
+
+            department = data['department']
+            section_id = data['section_id']
+
+            department_label = departments_label_map[department]
+            weizhi_label = section_id
+
+
+            sentence_ners = []
+            std_ner = []
+            sentence_attrs = []
+
+            for sentence_attr in attributes:
+                entity_ids = sentence_attr['entity']
+                attr_label = sentence_attr['type']
+                ent = std_ners[entity_ids]
+                sentence_attrs.append((ent['start'], ent['end'], attr_label))
+
+
+            if self.do_test:
+                sentence_ners = ners[0]
+            else:
+                for entity in ners:
+                    sentence_ners.append((entity['start'], entity['end'], entity['type']))
+            for entity in std_ners:
+                std_ner.append((entity['start'], entity['end'], entity['type']))
+
+            std_entity_labels = {}
+            self.ner_tot_recall += len(std_ner)
+            for start, end, label in std_ner:
+                std_entity_labels[(start, end)] = label
+                self.ner_golden_labels.add(((l_idx, 0), (start, end), label))
+            self.global_predicted_ners[(l_idx, 0)] = list(sentence_ners)
+
+            target_tokens = words
+            target_tokens = target_tokens[: self.max_seq_length - 3] + [tokenizer.sep_token]
+            assert (len(target_tokens) <= self.max_seq_length - 2)
+
+            pos2attrlabel = {}#这里构建了实体到属性标签的映射表
+            for x in sentence_attrs:
+                pos = (x[0], x[1])
+                attr_label = attr_label_map[x[2]]
+                if pos2attrlabel.get(pos, -1) == -1:
+                    num_attr_label = len(self.attr_label_list)
+                    pos2attrlabel[pos] = [0] * num_attr_label
+                pos2attrlabel[pos][attr_label] = 1#表示该实体由这个属性
+
+                if pos2attrlabel.get(((l_idx, 0), pos), -1) == -1:
+                    self.golden_labels_map[((l_idx, 0), pos)] = [0] * num_attr_label
+
+                self.golden_labels[((l_idx, 0), pos)] = x[2]
+                self.golden_labels_map[((l_idx, 0), pos)][attr_label] = 1
+            entities = list(sentence_ners)
+            if not self.evaluate:
+                entities.append((10000, 10000, 'NIL'))  # only for NER
+
+            cur_ins = []
+            for sub in entities:
+                if sub[0] < 10000:
+                    sub_s = sub[0]
+                    sub_e = sub[1]
+                    sub_label = ner_label_map[sub[2]]
+                    sub_tokens= target_tokens
+                else:
+                    sub_s = len(target_tokens)
+                    sub_e = len(target_tokens) + 1
+                    sub_tokens = target_tokens + ['[unused0]', '[unused1]']
+                    sub_label = -1
+
+                cur_ins.append(((sub_s, sub_e, sub_label), pos2attrlabel.get((sub_s,sub_e), [0]*len(self.attr_label_list))))#案例是每个实体和它所对应的多标签
+                maxR = max(maxR, len(cur_ins))
+            dL = self.max_pair_length
+            if self.args.shuffle:
+                np.random.shuffle(cur_ins)
+            for i in range(0, len(cur_ins), dL):
+                examples = cur_ins[i: i + dL]
+                item = {
+                    'index': (l_idx, 0),
+                    'sentence': sub_tokens,
+                    'examples': examples,
+                    'weizhi_label': weizhi_label,
+                    'department_label': department_label,
+                }
+                #if i < len(examples) and examples[i][1] != [0,0,0,0,0,0,0,0,0,0]:
+                #    print(i,examples[i] )
+                self.data.append(item)
+        logger.info('maxR: %s', maxR)
+        logger.info('maxL: %s', maxL)
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        entry = self.data[idx]
+
+        input_ids = self.tokenizer.convert_tokens_to_ids(entry['sentence'])
+        #examples = entry['examples']
+
+        weizhi_label = entry['weizhi_label']
+        department_label = entry['department_label']
+
+        L = len(input_ids)
+        input_ids += [self.tokenizer.pad_token_id] * (self.max_seq_length - len(input_ids))
+
+        attention_mask = torch.zeros(
+            (self.max_entity_length + self.max_seq_length + 2, self.max_entity_length + self.max_seq_length + 2),
+            dtype=torch.int64)
+        attention_mask[:L, :L] = 1
+
+        if self.model_type.startswith('albert'):
+            input_ids = input_ids + [30002] * (len(entry['examples'])) + [self.tokenizer.pad_token_id] * (
+                    self.max_pair_length - len(entry['examples']))
+            input_ids = input_ids + [30003] * (len(entry['examples'])) + [self.tokenizer.pad_token_id] * (
+                    self.max_pair_length - len(entry['examples']))  # for debug
+            input_ids = input_ids + [30004] * (2)  # for debug
+        else:
+            input_ids = input_ids + [3] * (len(entry['examples'])) + [self.tokenizer.pad_token_id] * (
+                    self.max_pair_length - len(entry['examples']))
+            input_ids = input_ids + [4] * (len(entry['examples'])) + [self.tokenizer.pad_token_id] * (
+                    self.max_pair_length - len(entry['examples']))  # for debug
+            input_ids = input_ids + [5] * (2)  # for debug
+
+        attr_labels = []
+        ner_labels = []
+        mention_pos = []
+        mention_2 = []
+        position_ids = list(range(self.max_seq_length)) + [0] * (self.max_entity_length + 2)
+        num_pair = self.max_pair_length
+
+        position_ids[-1] = 511
+        position_ids[-2] = 510  # 最后两个额外的marker绑定给位置0
+        attention_mask[-2:, :L] = 1
+        department_em = '[unused%d]' % (60 + department_label)
+        weizhi_em = '[unused%d]' % (90 + weizhi_label)
+        input_ids[-2] = self.tokenizer.convert_tokens_to_ids(department_em)
+        input_ids[-1] = self.tokenizer.convert_tokens_to_ids(weizhi_em)
+        if self.args.add_binglixinxi == 1 or self.args.add_binglixinxi == 3:
+            attention_mask[:L, -1] = 1
+        if self.args.add_binglixinxi == 2 or self.args.add_binglixinxi == 3:
+            attention_mask[:L, -2] = 1
+
+
+        for x_idx, example in enumerate(entry['examples']):
+            ent = example[0]  # 对应的实体信息，包括实体位置和实体类别标签
+            label = example[1]  # 实体对应的属性标签，对应的是多标签
+
+            mention_pos.append((ent[0], ent[1]))
+            mention_2.append((ent[0], ent[1]))
+
+            w1 = x_idx
+            w2 = w1 + num_pair
+
+            w1 += self.max_seq_length
+            w2 += self.max_seq_length
+
+            position_ids[w1] = ent[0]
+            position_ids[w2] = ent[1]
+
+            for xx in [w1, w2]:
+                for yy in [w1, w2]:
+                    attention_mask[xx, yy] = 1
+                attention_mask[xx, :L] = 1
+
+            attr_labels.append(label)
+            ner_labels.append(ent[2])
+
+            if self.use_typemarker:
+                l_m = '[unused%d]' % (2 + ent[2] + len(self.ner_label_list) * 2)
+                r_m = '[unused%d]' % (2 + ent[2] + len(self.ner_label_list) * 3)
+                l_m = self.tokenizer._convert_token_to_id(l_m)
+                r_m = self.tokenizer._convert_token_to_id(r_m)
+                input_ids[w1] = l_m
+                input_ids[w2] = r_m
+
+        pair_L = len(entry['examples'])
+        mention_pos += [(0, 0)] * (num_pair - len(mention_pos))
+        attr_labels += [[0]*len(self.attr_label_list)] * (num_pair - len(attr_labels))
+        ner_labels += [-1] * (num_pair - len(ner_labels))
+
+        item = [torch.tensor(input_ids),
+                attention_mask,
+                torch.tensor(position_ids),
+                torch.tensor(mention_pos),
+                torch.tensor(attr_labels, dtype=torch.int64),
+                torch.tensor(ner_labels, dtype=torch.int64)
+                ]
+
+        if self.evaluate:
+            item.append(entry['index'])
+            #item.append(sub)
+            item.append(mention_2)
+
+        return item
+
+    @staticmethod
+    def collate_fn(batch):
+        fields = [x for x in zip(*batch)]
+
+        num_metadata_fields = 2
+        stacked_fields = [torch.stack(field) for field in fields[:-num_metadata_fields]]  # don't stack metadata fields
+        stacked_fields.extend(fields[-num_metadata_fields:])  # add them as lists not torch tensors
+
+        return stacked_fields
+
+
+def set_seed(args):
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if args.n_gpu > 0:
+        torch.cuda.manual_seed_all(args.seed)
+
+
+def _rotate_checkpoints(args, checkpoint_prefix, use_mtime=False):
+    if not args.save_total_limit:
+        return
+    if args.save_total_limit <= 0:
+        return
+
+    # Check if we should delete older checkpoint(s)
+    glob_checkpoints = glob.glob(os.path.join(args.output_dir, '{}-*'.format(checkpoint_prefix)))
+    if len(glob_checkpoints) <= args.save_total_limit:
+        return
+
+    ordering_and_checkpoint_path = []
+    for path in glob_checkpoints:
+        if use_mtime:
+            ordering_and_checkpoint_path.append((os.path.getmtime(path), path))
+        else:
+            regex_match = re.match('.*{}-([0-9]+)'.format(checkpoint_prefix), path)
+            if regex_match and regex_match.groups():
+                ordering_and_checkpoint_path.append((int(regex_match.groups()[0]), path))
+
+    checkpoints_sorted = sorted(ordering_and_checkpoint_path)
+    checkpoints_sorted = [checkpoint[1] for checkpoint in checkpoints_sorted]
+    number_of_checkpoints_to_delete = max(0, len(checkpoints_sorted) - args.save_total_limit)
+    checkpoints_to_be_deleted = checkpoints_sorted[:number_of_checkpoints_to_delete]
+    for checkpoint in checkpoints_to_be_deleted:
+        logger.info("Deleting older checkpoint [{}] due to args.save_total_limit".format(checkpoint))
+        shutil.rmtree(checkpoint)
+
+
+def train(args, model, tokenizer):
+    """ Train the model """
+    if args.local_rank in [-1, 0]:
+        tb_writer = SummaryWriter(
+            "logs/" + args.data_dir[max(args.data_dir.rfind('/'), 0):] + "_re_logs/" + args.output_dir[
+                                                                                       args.output_dir.rfind('/'):])
+
+    args.train_batch_size = args.per_gpu_train_batch_size * max(1, args.n_gpu)
+
+    train_dataset = ACEDataset(tokenizer=tokenizer, args=args, max_pair_length=args.max_pair_length)
+
+    train_sampler = RandomSampler(train_dataset) if args.local_rank == -1 else DistributedSampler(train_dataset)
+    train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.train_batch_size,
+                                  num_workers=4 * int(args.output_dir.find('test') == -1))
+
+    if args.max_steps > 0:
+        t_total = args.max_steps
+        args.num_train_epochs = args.max_steps // (len(train_dataloader) // args.gradient_accumulation_steps) + 1
+    else:
+        t_total = len(train_dataloader) // args.gradient_accumulation_steps * args.num_train_epochs
+
+    # Prepare optimizer and schedule (linear warmup and decay)
+    no_decay = ['bias', 'LayerNorm.weight']
+    optimizer_grouped_parameters = [
+        {'params': [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
+         'weight_decay': args.weight_decay},
+        {'params': [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
+    ]
+
+    optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate, eps=args.adam_epsilon)
+    if args.warmup_steps == -1:
+        scheduler = get_linear_schedule_with_warmup(
+            optimizer, num_warmup_steps=int(0.1 * t_total), num_training_steps=t_total
+        )
+    else:
+        scheduler = get_linear_schedule_with_warmup(
+            optimizer, num_warmup_steps=args.warmup_steps, num_training_steps=t_total
+        )
+
+    if args.fp16:
+        try:
+            from apex import amp
+        except ImportError:
+            raise ImportError("Please install apex from https://www.github.com/nvidia/apex to use fp16 training.")
+        model, optimizer = amp.initialize(model, optimizer, opt_level=args.fp16_opt_level)
+    # ori_model = model
+    # multi-gpu training (should be after apex fp16 initialization)
+    if args.n_gpu > 1:
+        model = torch.nn.DataParallel(model)
+
+    # Distributed training (should be after apex fp16 initialization)
+    if args.local_rank != -1:
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.local_rank],
+                                                          output_device=args.local_rank,
+                                                          find_unused_parameters=True)
+
+    # Train!
+    logger.info("***** Running training *****")
+    logger.info("  Num examples = %d", len(train_dataset))
+    logger.info("  Num Epochs = %d", args.num_train_epochs)
+    logger.info("  Instantaneous batch size per GPU = %d", args.per_gpu_train_batch_size)
+    logger.info("  Total train batch size (w. parallel, distributed & accumulation) = %d",
+                args.train_batch_size * args.gradient_accumulation_steps * (
+                    torch.distributed.get_world_size() if args.local_rank != -1 else 1))
+    logger.info("  Gradient Accumulation steps = %d", args.gradient_accumulation_steps)
+    logger.info("  Total optimization steps = %d", t_total)
+
+    global_step = 0
+    tr_loss, logging_loss = 0.0, 0.0
+    tr_ner_loss, logging_ner_loss = 0.0, 0.0
+    tr_ae_loss, logging_ae_loss = 0.0, 0.0
+
+    model.zero_grad()
+    train_iterator = trange(int(args.num_train_epochs), desc="Epoch", disable=args.local_rank not in [-1, 0])
+    set_seed(args)  # Added here for reproductibility (even between python 2 and 3)
+    best_f1 = -1
+
+    for _ in train_iterator:
+        if args.shuffle and _ > 0:
+            train_dataset.initialize()
+        epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=args.local_rank not in [-1, 0])
+        for step, batch in enumerate(epoch_iterator):
+
+            model.train()
+            batch = tuple(t.to(args.device) for t in batch)
+
+            inputs = {'input_ids': batch[0],
+                      'attention_mask': batch[1],
+                      'position_ids': batch[2],
+                      'mention_pos': batch[3],
+                      'attr_labels': batch[4],
+                      'ner_labels': batch[5],
+                      }
+
+            outputs = model(**inputs)
+            loss = outputs[0]  # model outputs are always tuple in pytorch-transformers (see doc)
+            ae_loss = outputs[1]
+            ner_loss = outputs[2]
+            # print(re_loss.size())
+
+            if args.n_gpu > 1:
+                loss = loss.mean()  # mean() to average on multi-gpu parallel training
+                ae_loss = ae_loss.mean()
+                ner_loss = ner_loss.mean()
+            if args.gradient_accumulation_steps > 1:
+                loss = loss / args.gradient_accumulation_steps
+                ae_loss = ae_loss / args.gradient_accumulation_steps
+                ner_loss = ner_loss / args.gradient_accumulation_steps
+
+            if args.fp16:
+                with amp.scale_loss(loss, optimizer) as scaled_loss:
+                    scaled_loss.backward()
+            else:
+                loss.backward()
+            #print('loss=',loss)
+            tr_loss += loss.item()
+            if ae_loss > 0:
+                tr_ae_loss += ae_loss.item()
+            if ner_loss > 0:
+                tr_ner_loss += ner_loss.item()
+
+            if (step + 1) % args.gradient_accumulation_steps == 0:
+                if args.max_grad_norm > 0:
+                    if args.fp16:
+                        torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), args.max_grad_norm)
+                    else:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+
+                optimizer.step()
+                scheduler.step()  # Update learning rate schedule
+                model.zero_grad()
+                global_step += 1
+
+                # if args.model_type.endswith('rel') :
+                #     ori_model.bert.encoder.layer[args.add_coref_layer].attention.self.relative_attention_bias.weight.data[0].zero_() # 可以手动乘个mask
+
+                if args.local_rank in [-1, 0] and args.logging_steps > 0 and global_step % args.logging_steps == 0:
+                    # Log metrics
+                    tb_writer.add_scalar('lr', scheduler.get_lr()[0], global_step)
+                    tb_writer.add_scalar('loss', (tr_loss - logging_loss) / args.logging_steps, global_step)
+                    logging_loss = tr_loss
+
+                    tb_writer.add_scalar('RE_loss', (tr_ae_loss - logging_ae_loss) / args.logging_steps, global_step)
+                    logging_ae_loss = tr_ae_loss
+
+                    tb_writer.add_scalar('NER_loss', (tr_ner_loss - logging_ner_loss) / args.logging_steps, global_step)
+                    logging_ner_loss = tr_ner_loss
+
+                if args.local_rank in [-1,
+                                       0] and args.save_steps > 0 and global_step % args.save_steps == 0:  # valid for bert/spanbert
+                    update = True
+                    # Save model checkpoint
+                    if args.evaluate_during_training:  # Only evaluate when single GPU otherwise metrics may not average well
+                        results = evaluate(args, model, tokenizer)
+                        f1 = results['f1']
+                        tb_writer.add_scalar('f1', f1, global_step)
+
+                        if f1 > best_f1:
+                            best_f1 = f1
+                            print('Best F1', best_f1)
+                        else:
+                            update = False
+
+                    if update:
+                        checkpoint_prefix = 'checkpoint'
+                        output_dir = os.path.join(args.output_dir, '{}-{}'.format(checkpoint_prefix, global_step))
+                        if not os.path.exists(output_dir):
+                            os.makedirs(output_dir)
+                        model_to_save = model.module if hasattr(model,
+                                                                'module') else model  # Take care of distributed/parallel training
+
+                        model_to_save.save_pretrained(output_dir)
+
+                        torch.save(args, os.path.join(output_dir, 'training_args.bin'))
+                        logger.info("Saving model checkpoint to %s", output_dir)
+
+                        _rotate_checkpoints(args, checkpoint_prefix)
+
+            if args.max_steps > 0 and global_step > args.max_steps:
+                epoch_iterator.close()
+                break
+        if args.max_steps > 0 and global_step > args.max_steps:
+            train_iterator.close()
+            break
+
+    if args.local_rank in [-1, 0]:
+        tb_writer.close()
+
+    return global_step, tr_loss / global_step, best_f1
+
+
+def to_list(tensor):
+    return tensor.detach().cpu().tolist()
+
+
+def evaluate(args, model, tokenizer, prefix="", do_test=False):
+    eval_output_dir = args.output_dir
+
+    eval_dataset = ACEDataset(tokenizer=tokenizer, args=args, evaluate=True, do_test=do_test,
+                              max_pair_length=args.max_pair_length)
+
+    golden_labels_map = eval_dataset.golden_labels_map
+    tot_recall = eval_dataset.tot_recall
+
+    if not os.path.exists(eval_output_dir) and args.local_rank in [-1, 0]:
+        os.makedirs(eval_output_dir)
+
+    args.eval_batch_size = args.per_gpu_eval_batch_size * max(1, args.n_gpu)
+
+    scores = defaultdict(dict)
+
+    logger.info("***** Running evaluation {} *****".format(prefix))
+    logger.info("  Batch size = %d", args.eval_batch_size)
+
+    model.eval()
+
+    eval_sampler = SequentialSampler(eval_dataset)
+    eval_dataloader = DataLoader(eval_dataset, sampler=eval_sampler, batch_size=args.eval_batch_size,
+                                 collate_fn=ACEDataset.collate_fn,
+                                 num_workers=4 * int(args.output_dir.find('test') == -1))
+
+    # Eval!
+    logger.info("  Num examples = %d", len(eval_dataset))
+
+    start_time = timeit.default_timer()
+
+    for batch in tqdm(eval_dataloader, desc="Evaluating"):
+        indexs = batch[-2]
+        #subs = batch[-2]
+        batch_m2s = batch[-1]
+        ner_labels = batch[5]
+
+        batch = tuple(t.to(args.device) for t in batch[:-2])
+
+        with torch.no_grad():
+            inputs = {'input_ids': batch[0],
+                      'attention_mask': batch[1],
+                      'position_ids': batch[2],
+                      'mention_pos': batch[3],
+                      #   'labels':         batch[4],
+                      #   'ner_labels':     batch[5],
+                      }
+
+
+            outputs = model(**inputs)
+
+            logits = outputs[0]
+
+            if args.eval_logsoftmax:  # perform a bit better
+                logits = torch.nn.functional.log_softmax(logits, dim=-1)
+
+            elif args.eval_softmax:
+                logits = torch.nn.functional.softmax(logits, dim=-1)
+            elif args.eval_sigmoid:
+                logits = torch.sigmoid(logits, dim=-1)
+
+            if args.use_ner_results or args.model_type.endswith('nonersub'):
+                ner_preds = ner_labels
+            else:
+                ner_preds = torch.argmax(outputs[1], dim=-1)
+            logits = logits.cpu().numpy()
+            ner_preds = ner_preds.cpu().numpy()
+            for i in range(len(indexs)):
+                index = indexs[i]
+                m2s = batch_m2s[i]
+                for j in range(len(m2s)):
+                    obj = m2s[j]
+                    ner_label = eval_dataset.ner_label_list[ner_preds[i, j]]
+                    scores[(index[0], index[1])][(obj[0], obj[1])] = (
+                        torch.tensor(logits[i, j]), ner_label)
+
+    cor = 0
+    tot_pred = 0
+    global_predicted_ners = eval_dataset.global_predicted_ners
+    tot_output_results = defaultdict(list)
+    if not args.eval_unidirect:  # eval_unidrect is for ablation study
+        # print (len(scores))
+        for example_index, pair_dict in sorted(scores.items(), key=lambda x: x[0]):
+            visited = set([])
+            sentence_results = []
+            for k1, (v1, v2_ner_label) in pair_dict.items():
+
+                if k1 in visited:
+                    continue
+                visited.add(k1)
+
+                if v2_ner_label == 'NIL':
+                    continue
+                aa = torch.tensor([1] * len(task_ae_labels['hwamei']))
+                bb = torch.tensor([0] * len(task_ae_labels['hwamei']))
+                v1 = torch.sigmoid(v1)
+                v2 = torch.where(v1 >= 0.5, aa, bb)#阈值设定0.5，按位取值，v1中值大于0.5的位置取1，小于0.5的位置取0
+
+                pred_label = v2
+                if v2.sum() > 0:#该实体有预测标签
+                    sentence_results.append((k1, pred_label, v2_ner_label))
+
+            #sentence_results.sort(key=lambda x: -x[0])
+            no_overlap = []
+
+
+            output_preds = []
+
+            for item in sentence_results:
+
+                no_overlap.append(item)
+
+            pos2ner = {}
+
+            for item in no_overlap:
+                ent = item[0]
+                pred_label  = item[1]
+                tot_pred += pred_label.sum()
+                golden_label = golden_labels_map.get((example_index, ent),[0]*len(task_ae_labels['hwamei']))
+                for i in range(len(task_ae_labels['hwamei'])):
+                    if golden_label[i] == 1 and pred_label[i] ==1:
+                        cor += 1
+
+                if ent not in pos2ner:
+                    pos2ner[ent] = item[2]
+
+                output_preds.append((ent, pred_label.tolist()))
+
+
+            if do_test:
+                # output_w.write(json.dumps(output_preds) + '\n')
+                tot_output_results[example_index[0]].append((example_index[1], output_preds))
+
+
+
+    evalTime = timeit.default_timer() - start_time
+    logger.info("  Evaluation done in total %f secs (%f example per second)", evalTime,
+                len(global_predicted_ners) / evalTime)
+
+    if do_test:
+        output_w = open(os.path.join(args.output_dir, 'pred_results.json'), 'w', encoding='utf-8')
+        json.dump(tot_output_results, output_w)
+
+
+    #cor = cor.tolist()
+    tot_pred = int(tot_pred)
+    p = cor / tot_pred if tot_pred > 0 else 0
+    r = cor / tot_recall
+    f1 = 2 * (p * r) / (p + r) if cor > 0 else 0.0
+    #assert (tot_recall == len(golden_labels))
+
+
+    results = {'f1': f1, 'precision':p, 'recall':r}
+
+    logger.info("Result: %s", json.dumps(results))
+
+    return results
+
+
+def main():
+    parser = argparse.ArgumentParser()
+
+    ## Required parameters
+    parser.add_argument("--data_dir", default='ace_data', type=str, required=True,
+                        help="The input data dir. Should contain the .tsv files (or other data files) for the task.")
+    parser.add_argument("--model_type", default=None, type=str, required=True,
+                        help="Model type selected in the list: " + ", ".join(MODEL_CLASSES.keys()))
+    parser.add_argument("--model_name_or_path", default=None, type=str, required=True,
+                        help="Path to pre-trained model or shortcut name selected in the list: " + ", ".join(
+                            ALL_MODELS))
+    parser.add_argument("--output_dir", default=None, type=str, required=True,
+                        help="The output directory where the model predictions and checkpoints will be written.")
+
+    ## Other parameters
+    parser.add_argument("--config_name", default="", type=str,
+                        help="Pretrained config name or path if not the same as model_name")
+    parser.add_argument("--tokenizer_name", default="", type=str,
+                        help="Pretrained tokenizer name or path if not the same as model_name")
+    parser.add_argument("--cache_dir", default="", type=str,
+                        help="Where do you want to store the pre-trained models downloaded from s3")
+    parser.add_argument("--max_seq_length", default=384, type=int,
+                        help="The maximum total input sequence length after tokenization. Sequences longer "
+                             "than this will be truncated, sequences shorter will be padded.")
+    parser.add_argument("--do_train", action='store_true',
+                        help="Whether to run training.")
+    parser.add_argument("--do_eval", action='store_true',
+                        help="Whether to run eval on the dev set.")
+
+    parser.add_argument("--evaluate_during_training", action='store_true',
+                        help="Rul evaluation during training at each logging step.")
+    parser.add_argument("--do_lower_case", action='store_true',
+                        help="Set this flag if you are using an uncased model.")
+
+    parser.add_argument("--per_gpu_train_batch_size", default=8, type=int,
+                        help="Batch size per GPU/CPU for training.")
+    parser.add_argument("--per_gpu_eval_batch_size", default=8, type=int,
+                        help="Batch size per GPU/CPU for evaluation.")
+    parser.add_argument('--gradient_accumulation_steps', type=int, default=1,
+                        help="Number of updates steps to accumulate before performing a backward/update pass.")
+    parser.add_argument("--learning_rate", default=2e-5, type=float,
+                        help="The initial learning rate for Adam.")
+    parser.add_argument("--weight_decay", default=0.0, type=float,
+                        help="Weight deay if we apply some.")
+    parser.add_argument("--adam_epsilon", default=1e-8, type=float,
+                        help="Epsilon for Adam optimizer.")
+    parser.add_argument("--max_grad_norm", default=1.0, type=float,
+                        help="Max gradient norm.")
+    parser.add_argument("--num_train_epochs", default=10.0, type=float,
+                        help="Total number of training epochs to perform.")
+    parser.add_argument("--max_steps", default=-1, type=int,
+                        help="If > 0: set total number of training steps to perform. Override num_train_epochs.")
+    parser.add_argument("--warmup_steps", default=-1, type=int,
+                        help="Linear warmup over warmup_steps.")
+
+    parser.add_argument('--logging_steps', type=int, default=5,
+                        help="Log every X updates steps.")
+    parser.add_argument('--save_steps', type=int, default=1000,
+                        help="Save checkpoint every X updates steps.")
+    parser.add_argument("--eval_all_checkpoints", action='store_true',
+                        help="Evaluate all checkpoints starting with the same prefix as model_name ending and ending with step number")
+    parser.add_argument("--no_cuda", action='store_true',
+                        help="Avoid using CUDA when available")
+    parser.add_argument('--overwrite_output_dir', action='store_true',
+                        help="Overwrite the content of the output directory")
+    parser.add_argument('--overwrite_cache', action='store_true',
+                        help="Overwrite the cached training and evaluation sets")
+    parser.add_argument('--seed', type=int, default=42,
+                        help="random seed for initialization")
+
+    parser.add_argument('--fp16', action='store_true',
+                        help="Whether to use 16-bit (mixed) precision (through NVIDIA apex) instead of 32-bit")
+    parser.add_argument('--fp16_opt_level', type=str, default='O1',
+                        help="For fp16: Apex AMP optimization level selected in ['O0', 'O1', 'O2', and 'O3']."
+                             "See details at https://nvidia.github.io/apex/amp.html")
+    parser.add_argument("--local_rank", type=int, default=-1,
+                        help="For distributed training: local_rank")
+    parser.add_argument('--server_ip', type=str, default='', help="For distant debugging.")
+    parser.add_argument('--server_port', type=str, default='', help="For distant debugging.")
+    parser.add_argument('--save_total_limit', type=int, default=1,
+                        help='Limit the total amount of checkpoints, delete the older checkpoints in the output_dir, does not delete by default')
+
+    parser.add_argument("--train_file", default="train.json", type=str)
+    parser.add_argument("--dev_file", default="dev.json", type=str)
+    parser.add_argument("--test_file", default="test.json", type=str)
+    parser.add_argument('--max_pair_length', type=int, default=64, help="")
+    parser.add_argument("--alpha", default=1.0, type=float)
+    parser.add_argument('--save_results', action='store_true')
+    parser.add_argument('--no_test', action='store_true')
+    parser.add_argument('--eval_logsoftmax', action='store_true')
+    parser.add_argument('--eval_softmax', action='store_true')
+    parser.add_argument('--shuffle', action='store_true')
+    parser.add_argument('--lminit', action='store_true')
+    parser.add_argument('--no_sym', action='store_true')
+    parser.add_argument('--att_left', action='store_true')
+    parser.add_argument('--att_right', action='store_true')
+    parser.add_argument('--use_ner_results', action='store_true')
+    parser.add_argument('--use_typemarker', action='store_true')
+    parser.add_argument('--eval_unidirect', action='store_true')
+
+    parser.add_argument('--add_lstm_for_re', action='store_true')
+    parser.add_argument('--add_binglixinxi', type=int, default=0,help='0表示不添加病历信息，1表示只添加department，2表示只添加section，3表示既tianjiadepartmen又添加section' )
+    parser.add_argument('--dont_use_ner_loss', action='store_true')
+
+    args = parser.parse_args()
+
+    if os.path.exists(args.output_dir) and os.listdir(
+            args.output_dir) and args.do_train and not args.overwrite_output_dir:
+        raise ValueError(
+            "Output directory ({}) already exists and is not empty. Use --overwrite_output_dir to overcome.".format(
+                args.output_dir))
+
+    def create_exp_dir(path, scripts_to_save=None):
+        if args.output_dir.endswith("test"):
+            return
+        if not os.path.exists(path):
+            os.mkdir(path)
+
+        print('Experiment dir : {}'.format(path))
+        if scripts_to_save is not None:
+            if not os.path.exists(os.path.join(path, 'scripts')):
+                os.mkdir(os.path.join(path, 'scripts'))
+            for script in scripts_to_save:
+                dst_file = os.path.join(path, 'scripts', os.path.basename(script))
+                shutil.copyfile(script, dst_file)
+
+    if args.do_train and args.local_rank in [-1, 0] and args.output_dir.find('test') == -1:
+        create_exp_dir(args.output_dir, scripts_to_save=['run_hwameiae_gongkai.py', 'transformers/src/transformers/modeling_bert.py',
+                                                         'transformers/src/transformers/modeling_albert.py', 'scripts2/run_hwameiae_gongkai2.sh'])
+
+    # Setup distant debugging if needed
+    if args.server_ip and args.server_port:
+        # Distant debugging - see https://code.visualstudio.com/docs/python/debugging#_attach-to-a-local-script
+        import ptvsd
+        print("Waiting for debugger attach")
+        ptvsd.enable_attach(address=(args.server_ip, args.server_port), redirect_output=True)
+        ptvsd.wait_for_attach()
+
+    # Setup CUDA, GPU & distributed training
+    if args.local_rank == -1 or args.no_cuda:
+        device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
+        args.n_gpu = torch.cuda.device_count()
+    else:  # Initializes the distributed backend which will take care of sychronizing nodes/GPUs
+        torch.cuda.set_device(args.local_rank)
+        device = torch.device("cuda", args.local_rank)
+        torch.distributed.init_process_group(backend='nccl')
+        args.n_gpu = 1
+    args.device = device
+
+    # Setup logging
+    logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
+                        datefmt='%m/%d/%Y %H:%M:%S',
+                        level=logging.INFO if args.local_rank in [-1, 0] else logging.WARN)
+    logger.warning("Process rank: %s, device: %s, n_gpu: %s, distributed training: %s, 16-bits training: %s",
+                   args.local_rank, device, args.n_gpu, bool(args.local_rank != -1), args.fp16)
+
+    # Set seed
+    set_seed(args)
+
+    num_attr_labels = 10
+    num_ner_labels = 19
+
+    # Load pretrained model and tokenizer
+    if args.local_rank not in [-1, 0]:
+        torch.distributed.barrier()  # Make sure only the first process in distributed training will download model & vocab
+
+    args.model_type = args.model_type.lower()
+
+    config_class, model_class, tokenizer_class = MODEL_CLASSES[args.model_type]
+
+    config = config_class.from_pretrained(args.config_name if args.config_name else args.model_name_or_path,
+                                          num_labels=num_attr_labels)
+    tokenizer = tokenizer_class.from_pretrained(args.model_name_or_path, do_lower_case=args.do_lower_case)
+
+    config.max_seq_length = args.max_seq_length
+    config.alpha = args.alpha
+    config.num_attr_labels = num_attr_labels
+    config.add_lstm_for_re = args.add_lstm_for_re
+    config.num_ner_labels  = num_ner_labels
+    config.add_binglixinxi = args.add_binglixinxi
+    config.dont_use_ner_loss = args.dont_use_ner_loss
+
+    model = model_class.from_pretrained(args.model_name_or_path, from_tf=bool('.ckpt' in args.model_name_or_path),
+                                        config=config)
+
+    if args.model_type.startswith('albert'):
+        if args.use_typemarker:
+            special_tokens_dict = {
+                'additional_special_tokens': ['[unused' + str(x) + ']' for x in range(num_ner_labels * 4 + 2)]}
+        else:
+            special_tokens_dict = {'additional_special_tokens': ['[unused' + str(x) + ']' for x in range(4)]}
+        tokenizer.add_special_tokens(special_tokens_dict)
+        # print ('add tokens:', tokenizer.additional_special_tokens)
+        # print ('add ids:', tokenizer.additional_special_tokens_ids)
+        model.albert.resize_token_embeddings(len(tokenizer))
+
+
+    if args.local_rank == 0:
+        torch.distributed.barrier()  # Make sure only the first process in distributed training will download model & vocab
+
+    model.to(args.device)
+
+    logger.info("Training/evaluation parameters %s", args)
+    best_f1 = 0
+    # Training
+    if args.do_train:
+        # train_dataset = load_and_cache_examples(args,  tokenizer, evaluate=False)
+        global_step, tr_loss, best_f1 = train(args, model, tokenizer)
+        logger.info(" global_step = %s, average loss = %s", global_step, tr_loss)
+
+    # Saving best-practices: if you use defaults names for the model, you can reload it using from_pretrained()
+    if args.do_train and (args.local_rank == -1 or torch.distributed.get_rank() == 0):
+        # Create output directory if needed
+        if not os.path.exists(args.output_dir) and args.local_rank in [-1, 0]:
+            os.makedirs(args.output_dir)
+        update = True
+        if args.evaluate_during_training:
+            results = evaluate(args, model, tokenizer)
+            f1 = results['f1']
+            if f1 > best_f1:
+                best_f1 = f1
+                print('Best F1', best_f1)
+            else:
+                update = False
+
+        if update:
+            checkpoint_prefix = 'checkpoint'
+            output_dir = os.path.join(args.output_dir, '{}-{}'.format(checkpoint_prefix, global_step))
+            if not os.path.exists(output_dir):
+                os.makedirs(output_dir)
+            model_to_save = model.module if hasattr(model,
+                                                    'module') else model  # Take care of distributed/parallel training
+
+            model_to_save.save_pretrained(output_dir)
+
+            torch.save(args, os.path.join(output_dir, 'training_args.bin'))
+            logger.info("Saving model checkpoint to %s", output_dir)
+            _rotate_checkpoints(args, checkpoint_prefix)
+
+        tokenizer.save_pretrained(args.output_dir)
+
+        torch.save(args, os.path.join(args.output_dir, 'training_args.bin'))
+
+    # Evaluation
+    results = {'dev_best_f1': best_f1}
+    if args.do_eval and args.local_rank in [-1, 0]:
+
+        checkpoints = [args.output_dir]
+
+        WEIGHTS_NAME = 'pytorch_model.bin'
+
+        if args.eval_all_checkpoints:
+            checkpoints = list(
+                os.path.dirname(c) for c in sorted(glob.glob(args.output_dir + '/**/' + WEIGHTS_NAME, recursive=True)))
+
+        logger.info("Evaluate the following checkpoints: %s", checkpoints)
+        for checkpoint in checkpoints:
+            global_step = checkpoint.split('-')[-1] if len(checkpoints) > 1 else ""
+
+            model = model_class.from_pretrained(checkpoint, config=config)
+
+            model.to(args.device)
+            result = evaluate(args, model, tokenizer, prefix=global_step, do_test=not args.no_test)
+            result = dict((k + '_{}'.format(global_step), v) for k, v in result.items())
+            results.update(result)
+        print(results)
+
+        if args.no_test:  # choose best resutls on dev set
+            bestv = 0
+            k = 0
+            for k, v in results.items():
+                if v > bestv:
+                    bestk = k
+            print(bestk)
+
+        output_eval_file = os.path.join(args.output_dir, "results.json")
+        json.dump(results, open(output_eval_file, "w", encoding='utf-8'), ensure_ascii=False)
+
+
+if __name__ == "__main__":
+    main()
+
